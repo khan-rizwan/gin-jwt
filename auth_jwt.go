@@ -2,12 +2,12 @@ package jwt
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/gin-gonic/gin/binding"
 	"gopkg.in/dgrijalva/jwt-go.v3"
 )
 
@@ -39,12 +39,12 @@ type GinJWTMiddleware struct {
 	// Callback function that should perform the authentication of the user based on userID and
 	// password. Must return true on success, false on failure. Required.
 	// Option return user id, if so, user id will be stored in Claim Array.
-	Authenticator func(userID string, password string, c *gin.Context) (string, bool)
+	Authenticator func(code string, c *gin.Context) (int, string, bool, error)
 
 	// Callback function that should perform the authorization of the authenticated user. Called
 	// only after an authentication success. Must return true on success, false on failure.
 	// Optional, default to success.
-	Authorizator func(userID string, c *gin.Context) bool
+	Authorizator func(userId int, role string, c *gin.Context) bool
 
 	// Callback function that will be called during login.
 	// Using this function it is possible to add additional payload data to the webtoken.
@@ -58,8 +58,9 @@ type GinJWTMiddleware struct {
 	Unauthorized func(*gin.Context, int, string)
 
 	// Set the identity handler function
-	IdentityHandler func(jwt.MapClaims) string
+	IdentityHandler func(jwt.MapClaims) int
 
+	AccessHandler func(jwt.MapClaims) string
 	// TokenLookup is a string in the form of "<source>:<name>" that is used
 	// to extract token from the request.
 	// Optional. Default value "header:Authorization".
@@ -123,8 +124,7 @@ var (
 
 // Login form structure.
 type Login struct {
-	Username string `form:"username" json:"username" binding:"required"`
-	Password string `form:"password" json:"password" binding:"required"`
+	Code string `form:"code" json:"code" binding:"required"`
 }
 
 // MiddlewareInit initialize jwt configs.
@@ -152,7 +152,7 @@ func (mw *GinJWTMiddleware) MiddlewareInit() error {
 	}
 
 	if mw.Authorizator == nil {
-		mw.Authorizator = func(userID string, c *gin.Context) bool {
+		mw.Authorizator = func(userId int, role string, c *gin.Context) bool {
 			return true
 		}
 	}
@@ -167,8 +167,15 @@ func (mw *GinJWTMiddleware) MiddlewareInit() error {
 	}
 
 	if mw.IdentityHandler == nil {
-		mw.IdentityHandler = func(claims jwt.MapClaims) string {
-			return claims["id"].(string)
+		mw.IdentityHandler = func(claims jwt.MapClaims) int {
+			id := int(claims["id"].(float64))
+			fmt.Println(claims["id"])
+			return id
+		}
+	}
+	if mw.AccessHandler == nil {
+		mw.AccessHandler = func(claims jwt.MapClaims) string {
+			return claims["role"].(string)
 		}
 	}
 
@@ -215,10 +222,11 @@ func (mw *GinJWTMiddleware) middlewareImpl(c *gin.Context) {
 	claims := token.Claims.(jwt.MapClaims)
 
 	id := mw.IdentityHandler(claims)
+	role := mw.AccessHandler(claims)
 	c.Set("JWT_PAYLOAD", claims)
 	c.Set("userID", id)
 
-	if !mw.Authorizator(id, c) {
+	if !mw.Authorizator(id, role, c) {
 		mw.unauthorized(c, http.StatusForbidden, mw.HTTPStatusMessageFunc(ErrForbidden, c))
 		return
 	}
@@ -234,22 +242,21 @@ func (mw *GinJWTMiddleware) LoginHandler(c *gin.Context) {
 	// Initial middleware default setting.
 	mw.MiddlewareInit()
 
-	var loginVals Login
-
-	if c.ShouldBindWith(&loginVals, binding.JSON) != nil {
-		mw.unauthorized(c, http.StatusBadRequest, mw.HTTPStatusMessageFunc(ErrMissingLoginValues, c))
-		return
-	}
-
+	loginVals := Login{}
+	loginVals.Code = c.Query("code")
+	// if c.ShouldBindWith(&loginVals, binding.JSON) != nil {
+	// 	mw.unauthorized(c, http.StatusBadRequest, mw.HTTPStatusMessageFunc(ErrMissingLoginValues, c))
+	// 	return
+	// }
 	if mw.Authenticator == nil {
 		mw.unauthorized(c, http.StatusInternalServerError, mw.HTTPStatusMessageFunc(ErrMissingAuthenticatorFunc, c))
 		return
 	}
 
-	userID, ok := mw.Authenticator(loginVals.Username, loginVals.Password, c)
+	userID, role, ok, error := mw.Authenticator(loginVals.Code, c)
 
 	if !ok {
-		mw.unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(ErrFailedAuthentication, c))
+		mw.unauthorized(c, http.StatusUnauthorized, mw.HTTPStatusMessageFunc(error, c))
 		return
 	}
 
@@ -257,18 +264,19 @@ func (mw *GinJWTMiddleware) LoginHandler(c *gin.Context) {
 	token := jwt.New(jwt.GetSigningMethod(mw.SigningAlgorithm))
 	claims := token.Claims.(jwt.MapClaims)
 
-	if mw.PayloadFunc != nil {
-		for key, value := range mw.PayloadFunc(loginVals.Username) {
-			claims[key] = value
-		}
-	}
+	// if mw.PayloadFunc != nil {
+	// 	for key, value := range mw.PayloadFunc(loginVals.) {
+	// 		claims[key] = value
+	// 	}
+	// }
 
-	if userID == "" {
-		userID = loginVals.Username
+	if userID == 0 {
+		userID = 0
 	}
 
 	expire := mw.TimeFunc().Add(mw.Timeout)
 	claims["id"] = userID
+	claims["role"] = role
 	claims["exp"] = expire.Unix()
 	claims["orig_iat"] = mw.TimeFunc().Unix()
 
